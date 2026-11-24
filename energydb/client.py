@@ -62,7 +62,7 @@ from energydb._io import (
     execute_read,
     write_manifest,
 )
-from energydb._join import EdgeSeriesKey, SeriesKey
+from energydb._join import EdgeSeriesKey, RowResult, SeriesKey
 from energydb._persist import create_edge, create_node_raw, register_tree_under
 from energydb.diff import TreeDiff
 from energydb.errors import ConfigurationError, NodeNotFoundError, ValidationError
@@ -1046,6 +1046,7 @@ class AsyncClient:
         | dict[SeriesKey, pd.DataFrame]
         | dict[EdgeSeriesKey, pl.DataFrame]
         | dict[EdgeSeriesKey, pd.DataFrame]
+        | list[RowResult]
         | ReadResult
     ):
         """Bulk read via manifest. Detects edge vs node routing automatically.
@@ -1084,6 +1085,15 @@ class AsyncClient:
           attribute (``key.path``) access both work. Sub-frames are sorted by
           ``valid_time`` ascending, then ``knowledge_time`` / ``change_time``
           when requested.
+        * ``output="by_row"``: a ``list`` of :class:`RowResult`, one entry
+          per manifest row in the manifest's own order — the per-line status
+          report of a batch read. Each entry pairs the row's ``key`` with a
+          ``status`` (``"ok"`` data returned, ``"empty"`` registered but no
+          rows in the window, ``"missing"`` no registered series) and its
+          values frame (``df``, ``None`` when ``"missing"``). A tag requested
+          twice gets two entries; nothing is collapsed onto a dict key.
+          ``"missing"`` entries appear only with ``on_missing="skip"`` — the
+          default ``"raise"`` still fails the batch on unregistered triples.
 
         ``backend="polars"`` (default) returns polars frames; ``"pandas"``
         converts at the boundary. Internal identifiers (``series_id``,
@@ -1136,6 +1146,7 @@ class AsyncClient:
         | dict[SeriesKey, pd.DataFrame]
         | dict[EdgeSeriesKey, pl.DataFrame]
         | dict[EdgeSeriesKey, pd.DataFrame]
+        | list[RowResult]
         | ReadResult
     ):
         """Bulk relative read via manifest.
@@ -1165,7 +1176,7 @@ class AsyncClient:
 
     @staticmethod
     def _with_missing(
-        result: pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame],
+        result: pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame] | list[RowResult],
         missing: pl.DataFrame,
         *,
         backend: Backend,
@@ -1177,6 +1188,7 @@ class AsyncClient:
         | dict[SeriesKey, pd.DataFrame]
         | dict[EdgeSeriesKey, pl.DataFrame]
         | dict[EdgeSeriesKey, pd.DataFrame]
+        | list[RowResult]
         | ReadResult
     ):
         """Convert a read to ``backend``, wrapping it iff ``on_missing="skip"``.

@@ -72,6 +72,16 @@ positional *and* attribute access.
    :members:
    :show-inheritance:
 
+Reads with ``output="by_row"`` return a ``list[RowResult]`` with one entry
+per manifest row, in manifest order.
+
+.. autoclass:: energydb.RowResult
+   :members:
+   :show-inheritance:
+
+.. autodata:: energydb.RowStatus
+   :annotation: = Literal["ok", "empty", "missing"]
+
 .. autofunction:: energydb.find
 
 

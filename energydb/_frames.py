@@ -13,11 +13,11 @@ from typing import Literal, cast
 import pandas as pd
 import polars as pl
 
-from energydb._join import EdgeSeriesKey, SeriesKey
+from energydb._join import EdgeSeriesKey, RowResult, SeriesKey
 from energydb.errors import ValidationError
 
 Backend = Literal["polars", "pandas"]
-Output = Literal["frame", "by_path"]
+Output = Literal["frame", "by_path", "by_row"]
 
 
 def to_polars(df: pl.DataFrame | pd.DataFrame) -> pl.DataFrame:
@@ -28,7 +28,7 @@ def to_polars(df: pl.DataFrame | pd.DataFrame) -> pl.DataFrame:
 
 
 def to_backend(
-    result: pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame],
+    result: pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame] | list[RowResult],
     backend: Backend,
 ) -> (
     pl.DataFrame
@@ -37,17 +37,23 @@ def to_backend(
     | dict[SeriesKey, pd.DataFrame]
     | dict[EdgeSeriesKey, pl.DataFrame]
     | dict[EdgeSeriesKey, pd.DataFrame]
+    | list[RowResult]
 ):
     """Convert an internal polars result to the user-requested backend.
 
-    Handles both the long-format ``pl.DataFrame`` and the per-series
-    ``dict[SeriesKey | EdgeSeriesKey, pl.DataFrame]`` shape. When
-    ``backend="pandas"`` and the input is a dict, each value is converted
-    in turn.
+    Handles the long-format ``pl.DataFrame``, the per-series
+    ``dict[SeriesKey | EdgeSeriesKey, pl.DataFrame]`` shape, and the
+    ``output="by_row"`` ``list[RowResult]``. When ``backend="pandas"`` and
+    the input is a dict or list, each frame inside is converted in turn.
     """
     if backend == "polars":
         return result
     if backend == "pandas":
+        if isinstance(result, list):
+            return [
+                RowResult(entry.key, entry.status, entry.df.to_pandas() if entry.df is not None else None)
+                for entry in result
+            ]
         if isinstance(result, dict):
             # ty narrows the value type to object after the isinstance.
             d = cast(dict[SeriesKey | EdgeSeriesKey, pl.DataFrame], result)

@@ -998,6 +998,12 @@ an ``output=`` kwarg that controls return shape:
   (``key.path``, ``key.name``, …). Each value is one DataFrame per series,
   carrying only the data columns (``valid_time``, ``value``, plus opt-in
   ``knowledge_time`` / ``change_time``), sorted by ``valid_time`` ascending.
+- ``output="by_row"`` — a ``list`` of :class:`~energydb.RowResult` entries,
+  **one per manifest row and in the manifest's own order**. This is the only
+  mode that keeps every requested row visible: a legal series that currently
+  has no data, an unregistered name, and a row that returned values are
+  distinguished by each entry's ``status``. Duplicate tags in the manifest
+  produce duplicate entries — they are never collapsed by a dict key.
 
 Use ``by_path`` when downstream code naturally operates per-series — model
 training, plotting, per-asset writes back. Series that resolve but have
@@ -1012,9 +1018,50 @@ name="power")``).
    for key, sub in by_series.items():
        train_one_model(key.path, sub)   # key is a SeriesKey NamedTuple
 
+Use ``by_row`` for a batch manifest whose rows you must account for
+individually — ingestion acknowledgements, per-request reporting, or joining
+results back to a caller-supplied list. Each :class:`~energydb.RowResult` is a
+``(key, status, df)`` ``NamedTuple`` (positional *and* attribute access):
+
+- ``status="ok"`` — the series resolved and returned rows; ``df`` is its
+  per-series frame.
+- ``status="empty"`` — the name is registered and resolved to a series, but
+  ClickHouse currently holds no rows for it; ``df`` is an empty, schema-ful
+  frame (never ``None``).
+- ``status="missing"`` — the row did not resolve (an unregistered name, or an
+  unknown ``*_uuid``); ``df`` is ``None``. ``key`` is the
+  :class:`~energydb.SeriesKey` / :class:`~energydb.EdgeSeriesKey` built from
+  the row's own columns when those suffice, and ``None`` for a bare
+  ``node_uuid`` / ``edge_uuid`` row with no path columns.
+
+Entries line up with the manifest by row position, including repeats.
+Repeated rows that return data share the same underlying frame. Pair it with
+``on_missing="skip"`` to get the row list *and* the deduplicated
+:class:`~energydb.ReadResult` summary; with the default
+``on_missing="raise"``, any missing row raises instead of returning.
+
+.. code-block:: python
+
+   rows, missing = client.read(
+       manifest, output="by_row", on_missing="skip"
+   )
+   for row in rows:                    # one RowResult per manifest row, in order
+       if row.status == "ok":
+           ...                         # row.key / row.df
+       elif row.status == "empty":
+           ...                         # registered, no data yet; row.df is empty
+       else:                           # "missing"
+           ...                         # unregistered; row.df is None
+
+Unlike the other two modes, ``by_row`` is only available on manifest reads
+(:meth:`Client.read <energydb.AsyncClient.read>` /
+:meth:`~energydb.AsyncClient.read_relative`): a scope read resolves a subtree
+and has no caller-ordered manifest, so it raises :class:`~energydb.ValidationError`.
+
 The ``backend=`` kwarg is orthogonal: ``backend="polars"`` (default)
-returns polars frames in both modes; ``backend="pandas"`` converts every
-frame at the boundary.
+returns polars frames in every mode; ``backend="pandas"`` converts every
+non-``None`` frame at the boundary (a ``"missing"`` row's ``df`` stays
+``None``).
 
 
 Atomic batches with ``transaction()``

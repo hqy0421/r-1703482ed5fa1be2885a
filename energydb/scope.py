@@ -564,6 +564,11 @@ class _BaseScope:
         parallel with the CH value read; otherwise (``.where()`` filters,
         uuid-addressed subtrees, or an unavailable engine) it runs sequentially.
         Results are identical either way.
+
+        ``output="by_row"`` is not available here: it reports one entry per
+        *manifest* row, and a scope read resolves a subtree rather than a
+        caller-ordered manifest, so it raises
+        :class:`~energydb.errors.ValidationError`.
         """
         if self._txn is not None:
             _ts_io_unsupported_in_txn("read")

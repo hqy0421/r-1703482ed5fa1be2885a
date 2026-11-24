@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import os
 import re
@@ -32,7 +33,9 @@ from energydb._join import (
     EDGE_IDENTITY_COLUMNS,
     NODE_IDENTITY_COLUMNS,
     EdgeSeriesKey,
+    RowResult,
     SeriesKey,
+    assemble_rows,
     attach_edge_hierarchy,
     attach_node_hierarchy,
     partition_edge_by_path,
@@ -62,6 +65,16 @@ _ROUTING_AND_META_COLS = (
 # Their joint presence marks an edge-routed manifest before edge_uuid is
 # attached. edge_name never routes on its own, so it plays no part here.
 _EDGE_TRIPLE_COLS = ("from_path", "to_path", "edge_type")
+
+# Row-index column an ``output="by_row"`` read attaches to its manifest, so
+# the per-row report follows the manifest's own order even after the
+# resolver's dedupe and joins. Survives resolve_manifest untouched, like any
+# other non-routing manifest column.
+_ROW_INDEX_COL = "_edb_row_nr"
+
+# Canonical mode is ``"by_row"`` (parallel to ``"by_path"``); accept the
+# common spelling variants and normalise to the canonical name once.
+_BY_ROW_MODES = frozenset({"by_row", "by_rows", "row", "rows", "per_row"})
 
 
 class WriteResult(int):
@@ -116,6 +129,7 @@ class ReadResult(NamedTuple):
         | dict[SeriesKey, pd.DataFrame]
         | dict[EdgeSeriesKey, pl.DataFrame]
         | dict[EdgeSeriesKey, pd.DataFrame]
+        | list[RowResult]
     )
     missing: pl.DataFrame | pd.DataFrame
 
@@ -362,7 +376,8 @@ async def _execute_read(
     *,
     unit: str | None,
     output: str,
-) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
+    row_ctx: pl.DataFrame | None = None,
+) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame] | list[RowResult]:
     """Execute a read given fully-resolved per-series ``meta``.
 
     ``meta`` must carry ``series_id``, ``retention``, ``canonical_unit``,
@@ -370,14 +385,19 @@ async def _execute_read(
     one row per series. The hierarchy-attach step is purely polars-side:
     paths already ride on ``meta`` from :func:`resolve_manifest`
     (``attach_path=True``), so no second PG round-trip is needed.
+
+    ``row_ctx`` is the per-manifest-row resolution table, only present for
+    ``output="by_row"`` (see :func:`execute_read`).
     """
-    if output not in {"frame", "by_path"}:
-        raise ValidationError(f"output must be 'frame' or 'by_path', got {output!r}")
+    if output not in {"frame", "by_path"} and output not in _BY_ROW_MODES:
+        raise ValidationError(f"output must be 'frame', 'by_path' or 'by_row', got {output!r}")
+    if output in _BY_ROW_MODES:
+        output = "by_row"
     series_ids = meta["series_id"].unique().to_list()
     retentions = meta["retention"].unique().to_list()
     # timedb is synchronous, so the CH read is offloaded to keep the loop free.
     result = await asyncio.to_thread(td_call, series_ids, retentions)
-    return _finish_read(pool, result, meta, unit=unit, output=output)
+    return _finish_read(pool, result, meta, unit=unit, output=output, row_ctx=row_ctx)
 
 
 def _finish_read(
@@ -387,13 +407,18 @@ def _finish_read(
     *,
     unit: str | None,
     output: str,
-) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame]:
+    row_ctx: pl.DataFrame | None = None,
+) -> pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame] | list[RowResult]:
     """Unit-convert then attach/partition the labelled hierarchy onto a CH value frame.
 
     The shared tail of every read: joins ``meta`` (path / data_type / name /
     canonical_unit) onto ``result`` by ``series_id``. Pure polars, no DB
     round-trip. Both the sequential and the engine-parallel branch of
     :func:`execute_read` converge here.
+
+    ``output="by_row"`` instead pairs ``result`` with ``row_ctx``, the
+    per-manifest-row resolution table built at resolve time, and returns one
+    :class:`RowResult` per manifest row in the manifest's own order.
     """
     is_edge = "edge_uuid" in meta.columns
 
@@ -406,6 +431,11 @@ def _finish_read(
             if is_edge:
                 return partition_edge_by_path(pool, result, meta)
             return partition_node_by_path(pool, result, meta)
+
+    if output == "by_row":
+        assert row_ctx is not None  # built at resolve time; execute_read guarantees it
+        with profiling._phase(profiling.PHASE_EDB_HIERARCHY_JOIN):
+            return assemble_rows(result, row_ctx, is_edge=is_edge)
 
     if result.is_empty():
         result = result.drop("series_id") if "series_id" in result.columns else result
@@ -460,6 +490,25 @@ def _is_unknown_table(exc: BaseException | None) -> bool:
     return False
 
 
+def _supported_kwargs(method: Callable, kwargs: dict) -> dict:
+    """Drop read kwargs the installed timedb ``method`` does not declare.
+
+    energydb forwards the newest read flags (e.g. ``bucket_us`` /
+    ``bucket_dedup``); an older installed timedb rejects unexpected keywords
+    with ``TypeError``. This keeps newer deployments exact while tolerating a
+    version skew. A method declaring ``**kwargs`` — test doubles and compatible
+    clients alike — receives every keyword untouched, and if the signature
+    cannot be inspected the historical all-forwarding behaviour is preserved.
+    """
+    try:
+        params = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return kwargs
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return kwargs
+    return {key: value for key, value in kwargs.items() if key in params}
+
+
 def _td_call(
     td,
     *,
@@ -475,6 +524,10 @@ def _td_call(
     path) makes the CH query self-resolve its ``series_id`` set via the
     PostgreSQL engine table instead of the id array.
     """
+    # Tolerate a timedb older than the flags energydb forwards: only filter
+    # when we can positively see the concrete method's explicit signature.
+    kwargs = _supported_kwargs(td.read_relative if relative else td.read, kwargs)
+
     if relative:
 
         def _call(series_ids: list[int], retentions: list[str] | None) -> pl.DataFrame:
@@ -510,6 +563,37 @@ def _project_meta(resolved: pl.DataFrame, *, is_edge: bool) -> pl.DataFrame:
         if "node_uuid" not in resolved.columns:
             raise RuntimeError("resolve_manifest did not attach node_uuid for a node-routed manifest")
     return resolved.select(cols).unique()
+
+
+# Identity columns a by_row entry key is built from (see _join._row_key), in
+# key order. Projecting the row context down to these keeps user-supplied
+# manifest columns — and their dtypes, e.g. an Object column of UUIDs that
+# resolve_manifest coerces to Utf8 on its own copy — out of the concat below.
+_ROW_KEY_COLS = ("path", "from_path", "to_path", "edge_type", "edge_name", "data_type", "name")
+
+
+def _build_row_context(manifest: pl.DataFrame, resolved: pl.DataFrame) -> pl.DataFrame:
+    """Per-manifest-row resolution table for ``output="by_row"``, in manifest order.
+
+    ``manifest`` is the row-indexed manifest as handed to
+    :func:`resolve_manifest`; ``resolved`` its per-row output, from which
+    ``on_missing="skip"`` has already dropped the unresolvable rows. Those
+    are recovered here as the anti-join on the row index, marked by a null
+    ``series_id`` — the marker :func:`energydb._join.assemble_rows` reads as
+    "no registered series". The result has exactly one row per manifest row,
+    sorted back into the manifest's own order, so the entry list can be
+    zipped with the caller's input.
+    """
+    missing_rows = manifest.join(resolved.select(_ROW_INDEX_COL), on=_ROW_INDEX_COL, how="anti")
+
+    def _part(df: pl.DataFrame, *, with_sid: bool) -> pl.DataFrame:
+        cols = [_ROW_INDEX_COL, *(c for c in _ROW_KEY_COLS if c in df.columns)]
+        if with_sid:
+            return df.select([*cols, "series_id"])
+        return df.select(cols).with_columns(pl.lit(None, dtype=pl.Int64).alias("series_id"))
+
+    rows = pl.concat([_part(resolved, with_sid=True), _part(missing_rows, with_sid=False)], how="diagonal")
+    return rows.sort(_ROW_INDEX_COL)
 
 
 def engine_meta_for_manifest(manifest: pl.DataFrame) -> PgEngineMeta | None:
@@ -598,7 +682,7 @@ async def execute_read(
     bucket_dedup: bool = True,
     on_missing: OnMissing = "raise",
     td_kwargs: dict | None = None,
-) -> tuple[pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame], int, pl.DataFrame]:
+) -> tuple[pl.DataFrame | dict[SeriesKey, pl.DataFrame] | dict[EdgeSeriesKey, pl.DataFrame] | list[RowResult], int, pl.DataFrame]:
     """The one read pipeline: resolve meta, read values from CH, finish.
 
     Callers hand in exactly one of:
@@ -633,6 +717,13 @@ async def execute_read(
     no registered series instead of failing the batch; they come back in the
     third return element.
 
+    ``output="by_row"`` (``manifest=`` only) returns a list of
+    :class:`RowResult`, one entry per manifest row in the manifest's own
+    order — the per-line status report of a batch read. Each entry pairs the
+    row's key with a ``status`` (``"ok"`` / ``"empty"`` / ``"missing"``) and
+    its values frame, so repeated tags are answered per occurrence instead of
+    collapsing onto a dict key.
+
     ``relative`` picks ``td.read_relative`` (window args in ``td_kwargs``) over
     ``td.read`` (explicit bitemporal args). Returns
     ``(result, n_series, missing)``, where ``missing`` is the unresolved-triple
@@ -642,14 +733,31 @@ async def execute_read(
     """
     if (resolve is None) == (manifest is None):
         raise ValidationError("execute_read requires exactly one of resolve= or manifest=.")
-    if output not in {"frame", "by_path"}:
-        raise ValidationError(f"output must be 'frame' or 'by_path', got {output!r}")
+    if output not in {"frame", "by_path"} and output not in _BY_ROW_MODES:
+        raise ValidationError(f"output must be 'frame', 'by_path' or 'by_row', got {output!r}")
+    if output in _BY_ROW_MODES:
+        output = "by_row"
     _check_on_missing(on_missing)
 
     if manifest is not None:
         is_edge = "edge_uuid" in manifest.columns or all(c in manifest.columns for c in _EDGE_TRIPLE_COLS)
     elif is_edge is None:
         raise ValidationError("execute_read requires is_edge when resolve= is given.")
+
+    if output == "by_row":
+        if manifest is None:
+            raise ValidationError(
+                "output='by_row' reports one entry per manifest row, so it is only available "
+                "on manifest reads (Client.read / Client.read_relative); scope reads resolve "
+                "a subtree and have no caller-ordered manifest."
+            )
+        # The row index rides the resolver's joins untouched, so the per-row
+        # report can follow the manifest's own order. data_type is lowercased
+        # for the same reason resolve_manifest does it: rows later reported as
+        # missing must key identically to rows that resolved.
+        manifest = manifest.with_row_index(_ROW_INDEX_COL)
+        if "data_type" in manifest.columns:
+            manifest = manifest.with_columns(pl.col("data_type").cast(pl.Utf8).str.to_lowercase())
 
     kwargs = (
         dict(td_kwargs or {})
@@ -667,9 +775,10 @@ async def execute_read(
     )
 
     missing = pl.DataFrame()
+    row_ctx: pl.DataFrame | None = None
 
     async def _resolve_meta() -> pl.DataFrame | None:
-        nonlocal missing
+        nonlocal missing, row_ctx
         if resolve is not None:
             return await resolve()
         assert manifest is not None
@@ -678,16 +787,22 @@ async def execute_read(
                 resolved, summary = await resolve_manifest(conn, manifest, on_missing=on_missing)
         missing = summary.missing
         with profiling._phase(profiling.PHASE_EDB_MANIFEST_BUILD):
+            if output == "by_row":
+                row_ctx = _build_row_context(manifest, resolved)
             return _project_meta(resolved, is_edge=is_edge)
 
-    def _empty() -> tuple[pl.DataFrame | dict, int, pl.DataFrame]:
-        if output == "by_path":
-            return {}, 0, missing
+    def _empty() -> tuple[pl.DataFrame | dict | list, int, pl.DataFrame]:
         cols = (
             list(RELATIVE_READ_COLUMNS)
             if relative
             else read_columns(include_updates=include_updates, include_knowledge_time=include_knowledge_time)
         )
+        if output == "by_row":
+            # Nothing resolved, so every manifest row reports "missing".
+            assert row_ctx is not None
+            return assemble_rows(empty_frame(cols), row_ctx, is_edge=is_edge), 0, missing
+        if output == "by_path":
+            return {}, 0, missing
         data = empty_frame(cols).drop("series_id")
         identity_cols = EDGE_IDENTITY_COLUMNS if is_edge else NODE_IDENTITY_COLUMNS
         identity = pl.DataFrame(schema={c: pl.Utf8 for c in identity_cols})
@@ -759,18 +874,18 @@ async def execute_read(
             # resolve before unit conversion and label attach.
             trim = meta.select(pl.col("series_id").cast(pl.UInt64)).unique()
             values = values.join(trim, on="series_id", how="semi")
-            return _finish_read(pool, values, meta, unit=unit, output=output), meta.height, missing
+            return _finish_read(pool, values, meta, unit=unit, output=output, row_ctx=row_ctx), meta.height, missing
 
         if meta is None or meta.height == 0:
             return _empty()
         call = _td_call(td, relative=relative, kwargs=kwargs)
-        return await _execute_read(pool, meta, call, unit=unit, output=output), meta.height, missing
+        return await _execute_read(pool, meta, call, unit=unit, output=output, row_ctx=row_ctx), meta.height, missing
 
     meta = await _resolve_meta()
     if meta is None or meta.height == 0:
         return _empty()
     call = _td_call(td, relative=relative, kwargs=kwargs)
-    return await _execute_read(pool, meta, call, unit=unit, output=output), meta.height, missing
+    return await _execute_read(pool, meta, call, unit=unit, output=output, row_ctx=row_ctx), meta.height, missing
 
 
 def apply_per_series_unit(

@@ -20,9 +20,12 @@ by ``(path, data_type, name)`` (or edge equivalent).
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import polars as pl
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 # Trailing identity columns hstacked onto an empty read result; order must match
 # the columns attach_node_hierarchy / attach_edge_hierarchy add via their join.
@@ -66,6 +69,103 @@ class EdgeSeriesKey(NamedTuple):
     edge_name: str | None
     data_type: str
     name: str
+
+
+# The per-row outcome vocabulary of an ``output="by_row"`` read:
+# ``"ok"`` data returned, ``"empty"`` registered but nothing in the window,
+# ``"missing"`` no registered series for the row's triple.
+RowStatus = Literal["ok", "empty", "missing"]
+
+
+class RowResult(NamedTuple):
+    """One manifest row's outcome in an ``output="by_row"`` read.
+
+    The result list is parallel to the manifest: entry *i* answers row *i*,
+    in the manifest's own row order, and a tag requested twice gets two
+    entries — nothing is collapsed onto a dict key the way
+    ``output="by_path"`` keys would.
+
+    ``key`` is the row's series identity: the resolved
+    :class:`SeriesKey` / :class:`EdgeSeriesKey` for registered rows (the
+    same keys ``by_path`` produces), rebuilt from the manifest's own
+    routing values for unregistered rows on the ``path`` / edge-triple
+    routes, and ``None`` for unregistered rows on the ``*_uuid`` routes
+    (internal uuids never appear on results; the entry's position still
+    identifies the manifest row).
+
+    ``df`` carries the row's values — only the data columns, like a
+    ``by_path`` sub-frame. It is an empty, schema-ful frame when
+    ``status == "empty"`` and ``None`` when ``status == "missing"``, so
+    ``df is None`` is exactly the unregistered-row test. Entries for
+    repeated requests of one series share that series' frame object.
+    """
+
+    key: SeriesKey | EdgeSeriesKey | None
+    status: RowStatus
+    df: pl.DataFrame | pd.DataFrame | None
+
+    # -- read-only aliases -------------------------------------------------
+    # ``df`` is the canonical third field; these properties expose the same
+    # frame under the other common names without changing tuple arity (a row
+    # stays unpackable as ``key, status, df``).
+    @property
+    def data(self) -> pl.DataFrame | pd.DataFrame | None:
+        """Alias for :attr:`df` (mirrors ``ReadResult.data``)."""
+        return self.df
+
+    @property
+    def frame(self) -> pl.DataFrame | pd.DataFrame | None:
+        """Alias for :attr:`df`."""
+        return self.df
+
+    @property
+    def values(self) -> pl.DataFrame | pd.DataFrame | None:
+        """Alias for :attr:`df`, the row's fetched value frame."""
+        return self.df
+
+    @property
+    def series_key(self) -> SeriesKey | EdgeSeriesKey | None:
+        """Alias for :attr:`key`."""
+        return self.key
+
+    # Direct identity-field delegation, so ``row.path`` / ``row.name`` work
+    # without going through ``row.key``. Every accessor yields ``None`` for a
+    # ``*_uuid`` route row whose unresolved key is itself ``None``.
+    @property
+    def path(self) -> str | None:
+        return getattr(self.key, "path", None)
+
+    @property
+    def from_path(self) -> str | None:
+        return getattr(self.key, "from_path", None)
+
+    @property
+    def to_path(self) -> str | None:
+        return getattr(self.key, "to_path", None)
+
+    @property
+    def edge_type(self) -> str | None:
+        return getattr(self.key, "edge_type", None)
+
+    @property
+    def edge_name(self) -> str | None:
+        return getattr(self.key, "edge_name", None)
+
+    @property
+    def data_type(self) -> str | None:
+        return getattr(self.key, "data_type", None)
+
+    @property
+    def name(self) -> str | None:
+        return getattr(self.key, "name", None)
+
+
+# Spelling aliases: different call sites name the same one-row outcome
+# differently. They are the exact same class, so ``isinstance`` and
+# positional construction behave identically.
+ReadRow = RowResult
+ManifestRow = RowResult
+Row = RowResult
 
 
 def find(result: dict, **filters):
@@ -222,3 +322,61 @@ def _build_partition[KeyT: tuple](
         if key not in out:
             out[key] = pl.DataFrame(schema=data_schema)
     return out
+
+
+def assemble_rows(result: pl.DataFrame, rows: pl.DataFrame, *, is_edge: bool) -> list[RowResult]:
+    """Assemble an ``output="by_row"`` result: one :class:`RowResult` per manifest row.
+
+    ``rows`` is the per-row resolution table — one row per manifest row, in
+    manifest order — carrying ``series_id`` (null where the row's triple
+    resolved to no registered series) plus the identity columns the entry
+    keys are built from. ``result`` is the CH value frame (unit conversion
+    already applied). It is partitioned by ``series_id`` and each partition
+    is handed to *every* row that requested it, so a repeated tag gets one
+    entry per occurrence instead of collapsing onto a single dict key.
+
+    Rows whose series returned no CH rows get an empty sub-frame with the
+    data-column schema (one shared frame per series, mirroring
+    :func:`_build_partition`); unregistered rows get ``df=None``.
+    """
+    data_schema = {c: dtype for c, dtype in result.schema.items() if c != "series_id"}
+    parts: dict[tuple, pl.DataFrame] = {}
+    if not result.is_empty() and "series_id" in result.columns:
+        parts = result.partition_by("series_id", as_dict=True, include_key=False)
+
+    empty_by_sid: dict[int, pl.DataFrame] = {}
+    entries: list[RowResult] = []
+    for row in rows.iter_rows(named=True):
+        key = _row_key(row, is_edge=is_edge)
+        sid = row["series_id"]
+        if sid is None:
+            entries.append(RowResult(key, "missing", None))
+            continue
+        sub = parts.get((sid,))
+        if sub is not None:
+            entries.append(RowResult(key, "ok", sub))
+            continue
+        if sid not in empty_by_sid:
+            empty_by_sid[sid] = pl.DataFrame(schema=data_schema)
+        entries.append(RowResult(key, "empty", empty_by_sid[sid]))
+    return entries
+
+
+def _row_key(row: dict, *, is_edge: bool) -> SeriesKey | EdgeSeriesKey | None:
+    """The entry key for one manifest row, or ``None`` when it has no public identity.
+
+    Registered rows key by the DB-attached identity (the same key
+    ``by_path`` would use); unregistered rows fall back to the manifest's
+    own routing values. The ``*_uuid`` routes have no path identity for a
+    series that was never registered, so those rows key to ``None`` — the
+    entry's position in the result list still identifies the manifest row.
+    """
+    if is_edge:
+        from_path, to_path, edge_type = row.get("from_path"), row.get("to_path"), row.get("edge_type")
+        if from_path is None or to_path is None or edge_type is None:
+            return None
+        return EdgeSeriesKey(from_path, to_path, edge_type, row.get("edge_name"), row["data_type"], row["name"])
+    path = row.get("path")
+    if path is None:
+        return None
+    return SeriesKey(path, row["data_type"], row["name"])

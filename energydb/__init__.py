@@ -68,7 +68,16 @@ from timedatamodel import (  # noqa: E402
 )
 
 from energydb._io import ReadResult, WriteResult  # noqa: E402
-from energydb._join import EdgeSeriesKey, SeriesKey, find  # noqa: E402
+from energydb._join import (  # noqa: E402
+    EdgeSeriesKey,
+    ManifestRow,
+    ReadRow,
+    Row,
+    RowResult,
+    RowStatus,
+    SeriesKey,
+    find,
+)
 from energydb._sync import Client  # noqa: E402
 from energydb._transaction import Transaction  # noqa: E402
 from energydb.client import AsyncClient  # noqa: E402
@@ -102,6 +111,12 @@ __all__ = [
     # By-path result keys
     "SeriesKey",
     "EdgeSeriesKey",
+    # By-row result entries
+    "RowResult",
+    "RowStatus",
+    "ReadRow",
+    "ManifestRow",
+    "Row",
     "find",
     # Diff
     "TreeDiff",
